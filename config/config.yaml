@@ -1,0 +1,3 @@
+feishu_webhook: "YOUR_FEISHU_WEBHOOK_URL"
+api_keys:
+  some_api: "YOUR_API_KEY"
