@@ -63,36 +63,125 @@ LogicAnchor/
 
 ## 🗄️ 4. 数据库表结构 (`logic_anchor.db`)
 
-1. **`positions` (持仓表)**
-   - `fund_code` (PK): 基金代码
-   - `initial_cost`: 累计持仓成本 (TEXT/Decimal)
-   - `hold_volume`: 绝对持有份额 (TEXT/Decimal)
-   - `last_nav` / `nav_date`: 最新净值及其日期
-   - `is_dirty`: 是否为延迟的脏数据
+### 4.1 统一约定（非常重要）
+- 所有金额/份额/净值字段一律用 `TEXT` 存储（内容为 Decimal 的字符串），避免浮点误差。
+- 所有写入数据库的数值都来自 `Decimal`，写入用 `str(x)`，读取后用 `Decimal(x)`。
 
-2. **`transactions` (流水表)**
-   - `id` (PK): MD5去重哈希
-   - `trade_date`, `fund_code`, `trade_type` (买入/卖出)
-   - `amount`: 交易金额
-   - `nav`: 确认净值
-   - `volume`: 确认份额
+### 4.2 `positions`（持仓表：你现在手里有多少“货”）
+**用途**：运行看板、计算持有收益、市值、份额。
 
-3. **`daily_nav` (每日净值留痕表)**
-   - `(fund_code, nav_date)` (联合PK)
-   - `nav`: 当日净值
-   - 作用：避免 AkShare 历史数据修正导致前后测算不一致，优先使用本地留痕的净值。
+**主键**：`fund_code`
 
-4. **`daily_metrics` (每日资产快照表)**
-   - `metric_date` (PK): 日期
-   - `total_cost`: 总投入成本
-   - `total_value`: 总市值
-   - `day_profit`: 当日总收益 (可能为 NULL/None)
-   - `hold_profit`: 累计总持有收益
-   - 作用：未来对接 Grafana 或 Echarts 绘制资产增长曲线的数据源。
+**字段说明**：
+- `fund_code`：基金代码（PK）
+- `fund_name`：基金名称
+- `initial_cost`：累计持仓成本（TEXT/Decimal）
+- `hold_volume`：绝对持有份额（TEXT/Decimal）
+- `last_nav`：最近一次成功使用的净值（TEXT/Decimal）
+- `nav_date`：`last_nav` 对应日期（YYYY-MM-DD）
+- `is_dirty`：1 表示净值延迟/待校准（例如 QDII 时差）
+- `updated_at`：更新时间
+
+### 4.3 `transactions`（流水表：每一次定投/卖出动作）
+**用途**：记录可追溯流水；同时作为“昨日收益剔除现金流”的输入。
+
+**主键**：`id`（MD5 去重哈希）
+
+**字段说明**：
+- `id`：MD5（由 `日期+代码+金额+类型` 拼接生成），用于防重复导入
+- `trade_date`：交易日期（YYYY-MM-DD）
+- `fund_code`：基金代码
+- `trade_type`：买入/卖出
+- `amount`：交易金额（TEXT/Decimal）
+- `nav`：确认净值（TEXT/Decimal，来自 AkShare）
+- `volume`：确认份额（TEXT/Decimal，买入=amount/nav；卖出目前也用 amount/nav 作为“反推份额”的简化口径）
+- `status`：默认 SUCCESS（预留给未来“挂起/失败/待补数据”）
+- `created_at`：写入时间
+
+### 4.4 `daily_nav`（每日净值留痕表：防止历史修正导致对不上）
+**用途**：净值“锁定”，避免 AkShare 历史净值修订导致回头看时收益变化。
+
+**主键**：`(fund_code, nav_date)` 联合主键
+
+**字段说明**：
+- `fund_code`：基金代码
+- `nav_date`：净值日期（YYYY-MM-DD）
+- `nav`：当日净值（TEXT/Decimal）
+- `is_dirty`：1 表示该净值是“延迟拿到的”（如 QDII 请求 3/24 得到 3/20）
+- `updated_at`：更新时间
+
+### 4.5 `daily_metrics`（每日资产快照表：给 Grafana/曲线使用）
+**用途**：每天跑一次看板，就把总资产汇总固化下来。
+
+**主键**：`metric_date`
+
+**字段说明**：
+- `metric_date`：日期（YYYY-MM-DD）
+- `total_cost`：总持仓成本（TEXT/Decimal）
+- `total_value`：总当前市值（TEXT/Decimal）
+- `day_profit`：总“昨日收益”（TEXT/Decimal 或 NULL；当部分基金不可算时为 NULL）
+- `hold_profit`：总持有收益（TEXT/Decimal）
+- `is_dirty`：1 表示当日快照存在延迟数据（例如纳指 QDII 未更新）
+- `updated_at`：更新时间
+
+### 4.6 `trade_history`（历史遗留表）
+当前代码仍保留 `trade_history` 的建表语句用于兼容迁移，但**业务逻辑已统一使用 `transactions`**。
 
 ---
 
-## 🚀 5. 未来扩展方向 (AI 接手提示)
+## 🧭 5. 日常操作流程（写 CSV 会发生什么）
+
+### 5.1 每天你需要做什么
+1. 在 [交易流水.csv](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/data/交易流水.csv) 追加一行（示例）：
+   - `2026-03-23,000216,50.00,买入`
+2. 运行：
+   - `python 运行.py 2026-03-24`（看 3/24 看板；若 3/24 无新净值，会沿用 3/23 的收益表现，并显示净值日）
+
+### 5.2 程序启动后执行的标准链路
+以你追加的这行 `2026-03-23,000216,50.00,买入` 为例，程序内部发生以下事情：
+
+**A. 读取 CSV 并识别新交易**（[trade_listener.py](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/core/trade_listener.py)）
+- 逐行读取 CSV 的 `日期/代码/金额/类型`
+- 生成 `trade_id = MD5(f\"日期_代码_金额_类型\")`
+- 去数据库查询 `transactions`，若 `trade_id` 已存在则跳过（防重复）
+
+**B. 获取确认净值（含重试）**（[akshare_adapter.py](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/adapters/akshare_adapter.py)）
+- 调用 `AkShareAdapter.get_fund_nav(code, date)`，遇到网络抖动会自动指数退避重试
+- 得到 `(nav, actual_date, is_dirty)`：
+  - `actual_date` 可能小于请求日期（QDII 时差），此时 `is_dirty=True`
+
+**C. 入库净值留痕**（[db_manager.py](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/infrastructure/db_manager.py)）
+- 写入/更新 `daily_nav(fund_code, actual_date)`，把净值锁定下来，后续优先使用留痕净值
+
+**D. 入库流水 + 更新持仓**（[trade_listener.py](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/core/trade_listener.py)）
+- 计算份额：买入 `volume = amount / nav`
+- 写入 `transactions`：新增一条流水记录
+- 更新 `positions`：
+  - 买入：`initial_cost += amount`，`hold_volume += volume`
+  - 同时更新 `last_nav/nav_date/is_dirty`
+
+**E. 打印看板 + 写入每日快照**（[运行.py](file:///e:/IDEA_code/个人项目/智矩交易LogicAnchor/运行.py)）
+- 对每只基金抓取“看板日的净值”（可能延迟），并显示“净值日”用于解释口径
+- 计算并显示：
+  - 当前市值：`hold_volume * nav`
+  - 持有收益：`当前市值 - initial_cost`
+  - 昨日收益：按照“剔除现金流”的公式计算；如果净值日落后太多则显示 `--`
+- 写入 `daily_metrics`：固化当天总成本/总市值/昨日收益（可空）/持有收益/is_dirty
+
+### 5.3 你在库里会看到哪些变化（总结）
+当你追加一条买入记录并运行程序后，通常会出现：
+- `transactions` 增加 1 行（新流水）
+- `positions` 对应基金的 `initial_cost`、`hold_volume` 发生变化
+- `daily_nav` 增加 1 行或更新 1 行（净值留痕）
+- `daily_metrics` 增加/更新 1 行（当天资产汇总快照）
+
+### 5.4 常见现象解释
+- “净值日”不是看板日：说明数据延迟（尤其是 QDII），系统会标记为 `is_dirty` 并避免产生坏账
+- “昨日收益 = --”：说明这只基金当天无法严格按“昨日”口径计算（例如净值日停留在更早日期）
+
+---
+
+## 🚀 6. 未来扩展方向 (AI 接手提示)
 当用户提出新需求时，AI 应优先考虑以下方向：
 1. **数据可视化**：基于 `daily_metrics` 表，生成前端 HTML 或对接 Grafana。
 2. **飞书/微信机器人推送**：在 [运行.py] 跑完后，将看板字符串格式化后推送到 Webhook。
