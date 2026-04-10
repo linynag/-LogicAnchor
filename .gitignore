@@ -22,3 +22,6 @@ data/*
 
 debug_db.py
 *仓位*.txt
+
+!./data/logic_anchor.db
+!./data/交易流水.csv
